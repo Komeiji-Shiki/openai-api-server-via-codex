@@ -7,7 +7,7 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -26,27 +26,13 @@ from openai import (
 from openai.types.chat import ChatCompletionChunk
 from openai.types.responses import ResponseCompletedEvent, ResponseStreamEvent
 
+from tests.contract_helpers import flatten_text
+
 
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
-
-
-def _flatten_text(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return " ".join(filter(None, (_flatten_text(item) for item in value)))
-    if isinstance(value, dict):
-        if value.get("type") in {"input_text", "output_text", "text"}:
-            return str(value.get("text") or "")
-        return " ".join(
-            filter(
-                None, (_flatten_text(value.get(key)) for key in ("content", "input"))
-            )
-        )
-    return ""
 
 
 class _FakeCodexHandler(BaseHTTPRequestHandler):
@@ -98,6 +84,9 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
         self._proxy_response()
 
     def _responses_stream(self, payload: dict[str, Any]) -> None:
+        if payload.get("metadata", {}).get("contract") == "async_history":
+            self._async_history_stream(payload)
+            return
         type(self).counter += 1
         number = type(self).counter
         response_id = f"resp_contract_{number}"
@@ -124,7 +113,7 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
                 "status": "completed",
             }
         else:
-            text = "fake contract: " + _flatten_text(payload.get("input"))
+            text = "fake contract: " + flatten_text(payload.get("input"))
             item = {
                 "id": f"msg_contract_{number}",
                 "type": "message",
@@ -151,7 +140,7 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
                 "output_tokens_details": {"reasoning_tokens": 1},
             },
         }
-        if "CONTRACT-REASONING" in _flatten_text(payload.get("input")):
+        if "CONTRACT-REASONING" in flatten_text(payload.get("input")):
             response["output"].insert(
                 0,
                 {
@@ -217,7 +206,7 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
                 },
             ]
         )
-        if "CONTRACT-TRUNCATE" in _flatten_text(payload.get("input")):
+        if "CONTRACT-TRUNCATE" in flatten_text(payload.get("input")):
             events = [e for e in events if e["type"] != "response.completed"]
         chunks = (
             "".join(
@@ -244,6 +233,118 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
             },
             headers={"x-upstream-request-id": "contract-upstream"},
         )
+
+    def _async_history_stream(self, payload: dict[str, Any]) -> None:
+        type(self).counter += 1
+        rid = f"resp_history_{type(self).counter}"
+        history = payload["input"]
+        calls = [item for item in history if item.get("type") == "function_call"]
+        if calls:
+            assert calls[0]["async"] is True
+            assert calls[0]["future_field"] == "preserved"
+            assert any(
+                item.get("type") == "custom_tool_call" and item.get("async")
+                for item in history
+            )
+            assert any(item.get("encrypted_content") == "opaque" for item in history)
+            assert any(item.get("phase") == "commentary" for item in history)
+            final = any(item.get("type") == "function_call_output" for item in history)
+            if final:
+                result = next(
+                    item
+                    for item in history
+                    if item.get("type") == "function_call_output"
+                )
+                assert result["output"] == [{"type": "input_text", "text": "value"}]
+                assert any(
+                    item.get("type") == "custom_tool_call_output"
+                    and item["output"] == "custom result"
+                    for item in history
+                )
+            items = [
+                {
+                    "id": "msg_history",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "FINAL_OK" if final else "PENDING_OK",
+                            "annotations": [],
+                        }
+                    ],
+                }
+            ]
+        else:
+            items = [
+                {
+                    "id": "fc_history",
+                    "type": "function_call",
+                    "call_id": "call_history",
+                    "name": "lookup",
+                    "arguments": "{}",
+                    "async": True,
+                    "future_field": "preserved",
+                    "status": "completed",
+                },
+                {
+                    "id": "custom_history",
+                    "type": "custom_tool_call",
+                    "call_id": "call_custom",
+                    "name": "custom_lookup",
+                    "input": "demo",
+                    "async": True,
+                },
+                {
+                    "id": "rs_history",
+                    "type": "reasoning",
+                    "encrypted_content": "opaque",
+                    "summary": [],
+                },
+                {
+                    "id": "msg_history",
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "INDEPENDENT_OK",
+                            "annotations": [],
+                        }
+                    ],
+                },
+            ]
+        response = {
+            "id": rid,
+            "object": "response",
+            "created_at": 0,
+            "model": payload["model"],
+            "status": "completed",
+            "output": items,
+        }
+        events: list[dict[str, Any]] = [
+            {
+                "type": "response.created",
+                "response": {**response, "status": "in_progress", "output": []},
+            }
+        ]
+        events.extend(
+            {"type": "response.output_item.done", "output_index": index, "item": item}
+            for index, item in enumerate(items)
+        )
+        events.append({"type": "response.completed", "response": response})
+        encoded = "".join(
+            "data: " + json.dumps({**event, "sequence_number": index}) + "\n\n"
+            for index, event in enumerate(events)
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
 
     def _json(
         self,
@@ -274,16 +375,6 @@ def fake_codex_url() -> Iterator[str]:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
-
-
-@pytest.fixture(scope="module")
-def go_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    binary = tmp_path_factory.mktemp("go-bin") / "openai-api-server-via-codex"
-    subprocess.run(
-        ["go", "build", "-o", str(binary), "./cmd/openai-api-server-via-codex"],
-        check=True,
-    )
-    return binary
 
 
 @pytest.fixture(scope="module")
@@ -359,9 +450,14 @@ def runtime_server(
 
 
 @pytest.fixture
-def contract_client(runtime_server: tuple[str, str]) -> AsyncOpenAI:
+async def contract_client(
+    runtime_server: tuple[str, str],
+) -> AsyncIterator[AsyncOpenAI]:
     _, base_url = runtime_server
-    return AsyncOpenAI(api_key="contract-server-key", base_url=f"{base_url}/v1")
+    async with AsyncOpenAI(
+        api_key="contract-server-key", base_url=f"{base_url}/v1"
+    ) as client:
+        yield client
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -622,7 +718,9 @@ async def test_contract_chat_lifecycle_streaming_and_tools(
     updated = await contract_client.chat.completions.update(
         completion.id, metadata={"suite": "updated"}
     )
-    assert updated.model_dump().get("metadata") == {"suite": "updated"}, runtime
+    assert updated.model_dump(by_alias=True).get("metadata") == {"suite": "updated"}, (
+        runtime
+    )
     messages = await contract_client.chat.completions.messages.list(completion.id)
     assert messages.data[0].role == "assistant", runtime
     descending_messages = await contract_client.chat.completions.messages.list(
@@ -683,7 +781,9 @@ async def test_contract_chat_lifecycle_streaming_and_tools(
     )
     tool_calls = tool.choices[0].message.tool_calls
     assert tool_calls is not None, runtime
-    assert tool_calls[0].model_dump()["function"]["name"] == "lookup_weather", runtime
+    assert (
+        tool_calls[0].model_dump(by_alias=True)["function"]["name"] == "lookup_weather"
+    ), runtime
 
     deleted = await contract_client.chat.completions.delete(completion.id)
     assert deleted.deleted is True, runtime
@@ -723,3 +823,72 @@ async def test_contract_images_audio_and_unknown_proxy(
         "/backend-api/codex/files/100%25done"
     ), runtime
     assert encoded_traversal.status_code == 400, runtime
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_contract_http_async_history(
+    contract_client: AsyncOpenAI, stream: bool
+) -> None:
+    from openai.types.responses import ResponseInputParam
+
+    first_items: list[dict[str, Any]] = []
+    metadata = {"contract": "async_history"}
+    if stream:
+        events = await contract_client.responses.create(
+            model="gpt-6-astra", input="initial", metadata=metadata, stream=True
+        )
+        first_id = ""
+        async for event in events:
+            data = event.model_dump(by_alias=True, exclude_none=True)
+            if data["type"] == "response.output_item.done":
+                first_items.append(data["item"])
+            if data["type"] == "response.completed":
+                first_id = data["response"]["id"]
+        assert first_id
+    else:
+        response = await contract_client.responses.create(
+            model="gpt-6-astra", input="initial", metadata=metadata
+        )
+        first_id = response.id
+        first_items = [
+            item.model_dump(by_alias=True, exclude_none=True)
+            for item in response.output
+        ]
+    assert first_items[0]["async"] is True
+    for mode in ["stored", "explicit"]:
+        kwargs: dict[str, Any] = (
+            {"previous_response_id": first_id, "input": "pending"}
+            if mode == "stored"
+            else {
+                "input": [
+                    {"role": "user", "content": "initial"},
+                    *first_items,
+                    {"role": "user", "content": "pending"},
+                ],
+            }
+        )
+        pending = await contract_client.responses.create(
+            model="gpt-6-astra", metadata=metadata, **kwargs
+        )
+        assert pending.output_text == "PENDING_OK"
+        final = await contract_client.responses.create(
+            model="gpt-6-astra",
+            metadata=metadata,
+            previous_response_id=pending.id,
+            input=cast(
+                ResponseInputParam,
+                [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_history",
+                        "output": [{"type": "input_text", "text": "value"}],
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call_custom",
+                        "output": "custom result",
+                    },
+                ],
+            ),
+        )
+        assert final.output_text == "FINAL_OK"

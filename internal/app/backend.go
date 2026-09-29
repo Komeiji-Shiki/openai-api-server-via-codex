@@ -114,13 +114,16 @@ func logAuthFailure(stage string, err error) {
 	)
 }
 
-func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(map[string]any) error) error {
-	b.debugf("codex.stream.start model=%s endpoint=%s/responses", stringValue(payload["model"]), b.cfg.BackendURL)
-	prepared := cloneMap(payload)
-	if _, provided := prepared["prompt_cache_key"]; !provided && b.cfg.AutoPromptCacheKey {
+func prepareCodexPayload(payload map[string]any, cfg config) map[string]any {
+	return normalizeCodexPayload(cloneMap(payload), cfg)
+}
+
+func normalizeCodexPayload(prepared map[string]any, cfg config) map[string]any {
+	// HTTP 与 WebSocket 使用相同的缓存策略，显式键和参数删除配置保持优先。
+	if _, provided := prepared["prompt_cache_key"]; !provided && cfg.AutoPromptCacheKey {
 		prepared["prompt_cache_key"] = defaultPromptCacheKey(prepared)
 	}
-	for _, name := range b.cfg.DropParams {
+	for _, name := range cfg.DropParams {
 		delete(prepared, name)
 	}
 	delete(prepared, "max_output_tokens")
@@ -144,6 +147,12 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 		include = append(include, "reasoning.encrypted_content")
 	}
 	prepared["include"] = include
+	return prepared
+}
+
+func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(map[string]any) error) error {
+	b.debugf("codex.stream.start model=%s endpoint=%s/responses", stringValue(payload["model"]), b.cfg.BackendURL)
+	prepared := prepareCodexPayload(payload, b.cfg)
 	body, _ := json.Marshal(prepared)
 	requestID := newID("req")
 	resp, err := b.doAuthenticated(func(cred credentials) (*http.Request, error) {

@@ -44,24 +44,27 @@ func TestBackendRequiresTerminalResponse(t *testing.T) {
 }
 
 func TestBackendStreamTimeoutIsIdleAndAllowsLongActiveStreams(t *testing.T) {
+	const idleTimeout = time.Second
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher := w.(http.Flusher)
-		for _, event := range []string{
-			`data: {"type":"response.created","response":{"status":"in_progress"}}` + "\n\n",
-			`data: {"type":"response.completed","response":{"status":"completed"}}` + "\n\n",
-		} {
-			_, _ = io.WriteString(w, event)
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"status":"in_progress"}}`+"\n\n")
+		flusher.Flush()
+		// 完成事件必须晚于总超时窗口，事件间隔则为繁忙的 CI 留出调度余量。
+		for started := time.Now(); time.Since(started) < idleTimeout*3/2; {
+			_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"."}`+"\n\n")
 			flusher.Flush()
-			time.Sleep(35 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 		}
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"status":"completed"}}`+"\n\n")
+		flusher.Flush()
 	}))
 	defer upstream.Close()
 	authPath := writeTestAuth(t, authDocument("test-token", nil))
 	cfg := defaultConfig()
 	cfg.BackendURL = upstream.URL
 	cfg.AuthJSON = authPath
-	cfg.Timeout = 50 * time.Millisecond
+	cfg.Timeout = idleTimeout
 	b := newBackend(cfg)
 	if _, err := b.collect(context.Background(), map[string]any{"model": defaultModel}); err != nil {
 		t.Fatalf("active stream exceeded total timeout unexpectedly: %v", err)
@@ -74,14 +77,14 @@ func TestBackendStreamIdleTimeoutReturnsGatewayError(t *testing.T) {
 		flusher := w.(http.Flusher)
 		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"status":"in_progress"}}`+"\n\n")
 		flusher.Flush()
-		time.Sleep(80 * time.Millisecond)
+		<-r.Context().Done()
 	}))
 	defer upstream.Close()
 	authPath := writeTestAuth(t, authDocument("test-token", nil))
 	cfg := defaultConfig()
 	cfg.BackendURL = upstream.URL
 	cfg.AuthJSON = authPath
-	cfg.Timeout = 25 * time.Millisecond
+	cfg.Timeout = 250 * time.Millisecond
 	b := newBackend(cfg)
 	_, err := b.collect(context.Background(), map[string]any{"model": defaultModel})
 	var backendErr *backendError

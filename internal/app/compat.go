@@ -125,7 +125,11 @@ func normalizeInputItem(value any) any {
 		setDefault(result, "arguments", "{}")
 		return result
 	case "function_call_output":
-		return map[string]any{"type": "function_call_output", "call_id": valueOr(item["call_id"], "unknown"), "output": stringValue(item["output"])}
+		result := cloneMap(item)
+		delete(result, "id")
+		delete(result, "status")
+		result["call_id"] = valueOr(item["call_id"], "unknown")
+		return result
 	}
 	return cloneMap(item)
 }

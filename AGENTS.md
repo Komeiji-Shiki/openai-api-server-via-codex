@@ -42,7 +42,7 @@ requests through `.github/workflows/ci.yml`.
 Run focused compatibility tests while iterating on request/response behavior:
 
 ```bash
-uv run python -m pytest tests/test_openai_client_contract.py -q
+uv run python -m pytest tests/test_openai_client_contract.py tests/test_openai_websocket_contract.py -q
 go test ./internal/app
 uv run ruff check .
 uv run ty check
@@ -180,11 +180,12 @@ python scripts/release-notes.py vX.Y.Z
   `max_concurrent_requests` defaulting to 10, expose it through CLI/env/config,
   and hold a slot for the full duration of streaming responses. `0` means no
   local concurrency cap.
-- Codex backend timeout defaults to 300 seconds. Keep CLI/env/config/default
-  fallback paths, config templates, README examples, and tests aligned when
-  changing that value.
+- Codex backend timeout defaults to 1800 seconds of HTTP upstream inactivity.
+  Preserve active long-running HTTP streams and use the timeout for WebSocket
+  handshakes, writes, and keepalives without imposing a connection lifetime.
+  Keep CLI/env/config/default paths, config templates, documentation, and tests aligned.
 - README examples should use the current preferred documented model. Keep the
-  examples on `gpt-5.6-luna` unless there is a deliberate model guidance change.
+  examples on `gpt-6-luna` unless there is a deliberate model guidance change.
   Do not confuse README example models with the server's compatibility default;
   changing `DEFAULT_MODEL` requires tests and config-template updates.
 - Keep the package version in `pyproject.toml` and

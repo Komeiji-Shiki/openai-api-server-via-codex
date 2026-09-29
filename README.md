@@ -4,12 +4,13 @@
 [![License](https://img.shields.io/github/license/Komeiji-Shiki/openai-api-server-via-codex)](LICENSE)
 
 本仓库基于 [hotchpotch/openai-api-server-via-codex](https://github.com/hotchpotch/openai-api-server-via-codex)
-独立维护，保留原项目的 Git 历史和 Apache-2.0 许可证。当前源码保存了基于上游
-`3ee9f2f` 的本地定制，上游 `0.2.1` 的 WebSocket 等功能尚未合并。
+独立维护，保留原项目的 Git 历史和 Apache-2.0 许可证。当前源码已合并上游
+`f248d96`，包含 `0.2.1` 的 Responses WebSocket、异步工具调用和生成过程中的指令追加功能。
 
 本地定制包括自动生成稳定的提示缓存键、回传缓存和推理 token 用量、完整保留加密推理及多轮历史、
 识别未正常结束的响应流，以及统一配置路径和后台启动参数。HTTP 超时默认按连续
-1800 秒未收到上游数据计算，持续输出的请求可以继续运行。详细记录见
+1800 秒未收到上游数据计算，持续输出的请求可以继续运行。WebSocket 请求沿用相同的缓存键策略，
+连接内的对话历史由上游保存。详细记录见
 [本地改动说明](docs/releases/HEAD.md)。
 
 ## 运行本仓库的定制版
@@ -89,8 +90,9 @@ from openai import OpenAI
 
 client = OpenAI()
 response = client.responses.create(
-    model="gpt-5.6-luna",
+    model="gpt-6-luna",
     input="Hello",
+    reasoning={"effort": "low"},
 )
 print(response.output_text)
 ```
@@ -223,16 +225,16 @@ Windows archives use `.zip`.
 For example, on an Apple silicon Mac:
 
 ```console
-$ curl -LO https://github.com/hotchpotch/openai-api-server-via-codex/releases/download/v0.2.0/openai-api-server-via-codex_0.2.0_darwin_arm64.tar.gz
-$ curl -LO https://github.com/hotchpotch/openai-api-server-via-codex/releases/download/v0.2.0/checksums.txt
+$ curl -LO https://github.com/hotchpotch/openai-api-server-via-codex/releases/download/v0.2.1/openai-api-server-via-codex_0.2.1_darwin_arm64.tar.gz
+$ curl -LO https://github.com/hotchpotch/openai-api-server-via-codex/releases/download/v0.2.1/checksums.txt
 $ grep 'darwin_arm64.tar.gz' checksums.txt | shasum -a 256 --check
-$ tar -xzf openai-api-server-via-codex_0.2.0_darwin_arm64.tar.gz
+$ tar -xzf openai-api-server-via-codex_0.2.1_darwin_arm64.tar.gz
 $ ./openai-api-server-via-codex --version
 ```
 
 The stable archive URLs and SHA-256 checksums are suitable for Homebrew
 Formulae. Installing a historical version through Homebrew requires a tap to
-retain a versioned Formula such as `openai-api-server-via-codex@0.2.0`.
+retain a versioned Formula such as `openai-api-server-via-codex@0.2.1`.
 
 </details>
 
@@ -242,7 +244,7 @@ retain a versioned Formula such as `openai-api-server-via-codex@0.2.0`.
 
 Stable Linux x86_64 and ARM64 images are published at
 `ghcr.io/hotchpotch/openai-api-server-via-codex`. `latest` tracks the newest
-stable release. Exact tags such as `v0.2.0` provide reproducible deployments;
+stable release. Exact tags such as `v0.2.1` provide reproducible deployments;
 prereleases publish only their exact version tag.
 
 The final Alpine image contains the Go server and CA certificates, but no
@@ -416,7 +418,7 @@ from openai import OpenAI
 
 client = OpenAI()
 chat = client.chat.completions.create(
-    model="gpt-5.6-luna",
+    model="gpt-6-luna",
     messages=[{"role": "user", "content": "Hello"}],
     reasoning_effort="low",
 )
@@ -432,7 +434,7 @@ Responses:
 
 ```python
 stream = client.responses.create(
-    model="gpt-5.6-luna",
+    model="gpt-6-luna",
     input="Stream a short reply.",
     stream=True,
     reasoning={"effort": "low"},
@@ -447,7 +449,7 @@ Chat Completions:
 
 ```python
 stream = client.chat.completions.create(
-    model="gpt-5.6-luna",
+    model="gpt-6-luna",
     messages=[{"role": "user", "content": "Stream a short reply."}],
     stream=True,
     reasoning_effort="low",
@@ -467,7 +469,7 @@ Image input:
 
 ```python
 response = client.responses.create(
-    model="gpt-5.6-luna",
+    model="gpt-6-luna",
     input=[
         {
             "role": "user",
@@ -510,7 +512,7 @@ streamed partial images are not implemented.
 
 ```python
 response = client.responses.create(
-    model="gpt-5.6-luna",
+    model="gpt-6-luna",
     input="What is the weather in Tokyo?",
     tools=[
         {
@@ -538,6 +540,8 @@ response = client.responses.create(
 
 - sync and async `openai-python` clients
 - non-streaming and streaming Responses and Chat Completions
+- Responses WebSocket relay with upstream conversation state, async tools, and
+  mid-turn steering ([usage and Codex limitations](docs/websocket-mode.md))
 - `previous_response_id` backed by bounded local context
 - stored Chat list/retrieve/update/delete/messages APIs
 - Responses retrieve streaming, delete, cancel, and input-token count
@@ -548,7 +552,7 @@ response = client.responses.create(
 - optional incoming API-key authentication
 - bounded request concurrency and in-memory stores
 
-At the Codex boundary, requests are normalized to `stream=true`, `store=false`,
+At the Codex HTTP boundary, requests are normalized to `stream=true`, `store=false`,
 low text verbosity by default, Codex-compatible tool defaults, and encrypted
 reasoning content. Public storage compatibility is implemented in the server's
 bounded in-memory stores.
@@ -565,6 +569,7 @@ when it is absent from the upstream catalog returned by `/v1/models`.
 | --- | --- |
 | `GET` | `/healthz` |
 | `GET` | `/v1/models` |
+| `GET` (WebSocket upgrade) | `/v1/responses` |
 | `POST` | `/v1/responses` |
 | `GET` | `/v1/responses/{response_id}` |
 | `DELETE` | `/v1/responses/{response_id}` |
@@ -578,6 +583,10 @@ when it is absent from the upstream catalog returned by `/v1/models`.
 | `POST` | `/v1/chat/completions/{completion_id}` |
 | `DELETE` | `/v1/chat/completions/{completion_id}` |
 | `GET` | `/v1/chat/completions/{completion_id}/messages` |
+
+WebSocket responses stay on the upstream connection and are not registered with
+the local HTTP retrieve/cancel helpers. Codex currently rejects Background mode
+and named WebSocket streams (`stream_id`); these features are not emulated.
 
 Unknown `/v1/...` requests use a best-effort fallback proxy. The server
 forwards the method, path, query, safe OpenAI-style headers, and body with its
@@ -611,11 +620,13 @@ Settings resolve in this order:
 CLI flag -> environment variable -> config file -> default
 ```
 
+Example configuration using `gpt-6-luna`:
+
 ```toml
 [server]
 host = "127.0.0.1"
 port = 18080
-default_model = "gpt-5.6-luna"
+default_model = "gpt-6-luna"
 timeout = 1800.0
 verbose = false
 max_stored_items = 1000
@@ -643,7 +654,7 @@ stop_timeout = 10.0
 | `server.default_model` | `gpt-5.6-luna` | Model used when a request omits one |
 | `server.api_key` | unset | Protect incoming `/v1/...` requests |
 | `server.max_stored_items` | `1000` | Bound local stores; `0` disables storage |
-| `server.max_concurrent_requests` | `10` | Bound complete requests/streams; `0` disables the cap |
+| `server.max_concurrent_requests` | `10` | Bound HTTP requests/streams and open WebSocket connections; full capacity returns 503 with `Retry-After`; `0` disables the cap |
 | `server.timeout` | `1800.0` | Maximum idle time without new upstream response data; active streams may run longer |
 | `server.verbose` | `false` | Enable redacted application diagnostics |
 | `codex.auth_json` | `~/.codex/auth.json` | Codex OAuth file |
@@ -748,6 +759,7 @@ Real Codex tests are opt-in because they use the current login, network, model
 allowance, and image quota:
 
 ```console
+$ RUN_CODEX_LIVE_TESTS=1 uv run python -m pytest tests/test_live_astra_websocket.py -q -s
 $ RUN_CODEX_LIVE_TESTS=1 go test ./test/live -v -count=1 -timeout=20m
 $ RUN_CODEX_LIVE_TESTS=1 uv run python -m pytest tests/test_live_integration.py -q -s
 $ RUN_CODEX_LIVE_TESTS=1 uv run python -m pytest tests/test_live_codex_http_compatibility.py -q -s
