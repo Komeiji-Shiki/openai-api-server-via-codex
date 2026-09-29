@@ -51,7 +51,7 @@ to invoke `openai-api-server-via-codex` without an absolute path.
 ## Build for the current machine
 
 ```console
-$ git clone https://github.com/hotchpotch/openai-api-server-via-codex.git
+$ git clone https://github.com/Komeiji-Shiki/openai-api-server-via-codex.git
 $ cd openai-api-server-via-codex
 $ go mod download
 $ mkdir -p bin
@@ -77,7 +77,7 @@ those flags when producing a binary for debugging.
 ## Windows PowerShell
 
 ```powershell
-git clone https://github.com/hotchpotch/openai-api-server-via-codex.git
+git clone https://github.com/Komeiji-Shiki/openai-api-server-via-codex.git
 Set-Location openai-api-server-via-codex
 go mod download
 New-Item -ItemType Directory -Force bin | Out-Null
@@ -110,6 +110,12 @@ terminal:
 $ curl http://127.0.0.1:18080/healthz
 $ curl http://127.0.0.1:18080/v1/models
 ```
+
+The default upstream response idle timeout is 1800 seconds. It applies to the
+response headers and to the gap between streamed data reads; each new upstream
+chunk resets the timer, so an active stream may run longer than 1800 seconds.
+Set `--timeout`, `OPENAI_VIA_CODEX_TIMEOUT`, or `server.timeout` in the TOML
+configuration to change it.
 
 Select another auth file or configuration when needed:
 

@@ -1,9 +1,32 @@
 # OpenAI API Server via Codex
 
-[![CI](https://github.com/hotchpotch/openai-api-server-via-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/hotchpotch/openai-api-server-via-codex/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/openai-api-server-via-codex.svg)](https://pypi.org/project/openai-api-server-via-codex/)
-[![GitHub Release](https://img.shields.io/github/v/release/hotchpotch/openai-api-server-via-codex?include_prereleases)](https://github.com/hotchpotch/openai-api-server-via-codex/releases)
-[![License](https://img.shields.io/github/license/hotchpotch/openai-api-server-via-codex)](LICENSE)
+[![CI](https://github.com/Komeiji-Shiki/openai-api-server-via-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/Komeiji-Shiki/openai-api-server-via-codex/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/Komeiji-Shiki/openai-api-server-via-codex)](LICENSE)
+
+本仓库基于 [hotchpotch/openai-api-server-via-codex](https://github.com/hotchpotch/openai-api-server-via-codex)
+独立维护，保留原项目的 Git 历史和 Apache-2.0 许可证。当前源码保存了基于上游
+`3ee9f2f` 的本地定制，上游 `0.2.1` 的 WebSocket 等功能尚未合并。
+
+本地定制包括自动生成稳定的提示缓存键、回传缓存和推理 token 用量、完整保留加密推理及多轮历史、
+识别未正常结束的响应流，以及统一配置路径和后台启动参数。HTTP 超时默认按连续
+1800 秒未收到上游数据计算，持续输出的请求可以继续运行。详细记录见
+[本地改动说明](docs/releases/HEAD.md)。
+
+## 运行本仓库的定制版
+
+安装 Go 1.23 或更新版本，并准备好 Codex 登录后，从本仓库源码启动：
+
+```console
+git clone https://github.com/Komeiji-Shiki/openai-api-server-via-codex.git
+cd openai-api-server-via-codex
+codex login
+go run ./cmd/openai-api-server-via-codex serve
+```
+
+当前尚未发布本仓库的独立安装包。下文保留的 `uvx`、PyPI、GHCR 和上游 Release
+安装命令获取的是上游发行版；使用上述源码启动方式才能运行本仓库的定制功能。
+
+---
 
 💰 Your ChatGPT subscription includes Codex, but that backend normally only
 talks to Codex clients. This server puts an OpenAI-compatible API in front of
@@ -347,6 +370,44 @@ For container-specific problems, see the [Docker guide](docs/docker.md).
 
 ## Usage examples
 
+### Prompt caching
+
+The server generates a stable `prompt_cache_key` by default when the caller
+omits it. The key hashes the model, instructions, tools, optional `user`, and
+leading system/developer input messages. Appending user messages or assistant
+replies does not change it. This groups related prompt templates without putting
+their raw text into headers. Explicit keys are forwarded by both Responses and
+Chat Completions; supply a stable session or shard key to control grouping in
+high-volume applications. Cache keys influence routing, not access control.
+
+To disable automatic key generation, use `--auto-prompt-cache-key=false`, set
+`OPENAI_VIA_CODEX_AUTO_PROMPT_CACHE_KEY=false`, or set
+`[compat].auto_prompt_cache_key = false`. This also works with `start`.
+Explicit keys remain effective when automatic generation is disabled. An
+explicit empty or null key suppresses generation for that request. Adding
+`prompt_cache_key` to `compat.drop_params` removes both explicit and generated
+keys. None of these options disables the upstream's own automatic caching.
+
+Responses retain `usage.input_tokens_details.cached_tokens`. Chat Completions
+expose it as `usage.prompt_tokens_details.cached_tokens`, including the final
+usage chunk when `stream_options={"include_usage": True}`. Reasoning token
+details are also preserved. Missing upstream details are not invented as zero.
+
+Caching depends on matching prefixes, the model, cache availability, and backend
+routing; a key never guarantees a hit. The local response store and downstream
+`store=false` are separate from prompt caching. The server does not automatically
+add cache retention settings or explicit breakpoints to Codex requests.
+
+```python
+chat = client.chat.completions.create(
+    model="gpt-5.6-luna",
+    messages=[{"role": "user", "content": "Continue our discussion."}],
+    prompt_cache_key="my-session-42",
+)
+if chat.usage and chat.usage.prompt_tokens_details:
+    print(chat.usage.prompt_tokens_details.cached_tokens)
+```
+
 <details>
 <summary><strong>Chat Completions</strong></summary>
 
@@ -540,6 +601,9 @@ $ openai-api-server-via-codex config-generate --stdout
 The default path is
 `$XDG_CONFIG_HOME/openai-api-server-via-codex/config.toml`, falling back to
 `~/.config/openai-api-server-via-codex/config.toml`.
+`--config` takes precedence over `OPENAI_VIA_CODEX_CONFIG` for both loading and
+generating configuration. Unless explicitly configured, daemon files use the
+selected configuration directory's `run/` subdirectory.
 
 Settings resolve in this order:
 
@@ -552,7 +616,7 @@ CLI flag -> environment variable -> config file -> default
 host = "127.0.0.1"
 port = 18080
 default_model = "gpt-5.6-luna"
-timeout = 300.0
+timeout = 1800.0
 verbose = false
 max_stored_items = 1000
 max_concurrent_requests = 10
@@ -565,9 +629,10 @@ client_version = "1.0.0"
 
 [compat]
 drop_params = []
+auto_prompt_cache_key = true
 
 [daemon]
-state_dir = "~/.config/openai-api-server-via-codex/run"
+# state_dir = "/custom/run" # otherwise use run/ next to the config file
 stop_timeout = 10.0
 ```
 
@@ -579,10 +644,11 @@ stop_timeout = 10.0
 | `server.api_key` | unset | Protect incoming `/v1/...` requests |
 | `server.max_stored_items` | `1000` | Bound local stores; `0` disables storage |
 | `server.max_concurrent_requests` | `10` | Bound complete requests/streams; `0` disables the cap |
-| `server.timeout` | `300.0` | Codex backend timeout in seconds |
+| `server.timeout` | `1800.0` | Maximum idle time without new upstream response data; active streams may run longer |
 | `server.verbose` | `false` | Enable redacted application diagnostics |
 | `codex.auth_json` | `~/.codex/auth.json` | Codex OAuth file |
 | `compat.drop_params` | `[]` | Top-level request fields removed before forwarding |
+| `compat.auto_prompt_cache_key` | `true` | Generate stable prompt cache routing keys when omitted |
 
 Examples:
 

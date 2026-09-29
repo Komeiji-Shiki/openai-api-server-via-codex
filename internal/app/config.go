@@ -24,22 +24,23 @@ const (
 )
 
 type config struct {
-	Host          string
-	Port          int
-	Model         string
-	BackendURL    string
-	ClientVersion string
-	AuthJSON      string
-	APIKey        string
-	Timeout       time.Duration
-	MaxStored     int
-	Concurrency   int
-	Verbose       bool
-	DropParams    []string
-	StateDir      string
-	PIDFile       string
-	LogFile       string
-	StopTimeout   time.Duration
+	Host               string
+	Port               int
+	Model              string
+	BackendURL         string
+	ClientVersion      string
+	AuthJSON           string
+	APIKey             string
+	Timeout            time.Duration
+	MaxStored          int
+	Concurrency        int
+	Verbose            bool
+	AutoPromptCacheKey bool
+	DropParams         []string
+	StateDir           string
+	PIDFile            string
+	LogFile            string
+	StopTimeout        time.Duration
 }
 
 func defaultConfig() config {
@@ -48,8 +49,9 @@ func defaultConfig() config {
 	return config{
 		Host: defaultHost, Port: defaultPort, Model: defaultModel,
 		BackendURL: defaultBackendURL, ClientVersion: defaultClient, AuthJSON: auth,
-		Timeout: 300 * time.Second, MaxStored: defaultMaxStored, Concurrency: defaultConcurrency,
-		StateDir: defaultStateDir(), StopTimeout: 10 * time.Second,
+		Timeout: 1800 * time.Second, MaxStored: defaultMaxStored, Concurrency: defaultConcurrency,
+		AutoPromptCacheKey: true,
+		StateDir:           defaultStateDir(), StopTimeout: 10 * time.Second,
 	}
 }
 
@@ -65,6 +67,7 @@ func (c *config) applyEnvironment() {
 	c.MaxStored = envInt("OPENAI_VIA_CODEX_MAX_STORED_ITEMS", c.MaxStored)
 	c.Concurrency = envInt("OPENAI_VIA_CODEX_MAX_CONCURRENT_REQUESTS", c.Concurrency)
 	c.Verbose = envBool("OPENAI_VIA_CODEX_VERBOSE", c.Verbose)
+	c.AutoPromptCacheKey = envBool("OPENAI_VIA_CODEX_AUTO_PROMPT_CACHE_KEY", c.AutoPromptCacheKey)
 	c.StateDir = envString("OPENAI_VIA_CODEX_STATE_DIR", c.StateDir)
 	c.PIDFile = envString("OPENAI_VIA_CODEX_PID_FILE", c.PIDFile)
 	c.LogFile = envString("OPENAI_VIA_CODEX_LOG_FILE", c.LogFile)
@@ -107,6 +110,7 @@ func Run(args []string, version string) error {
 	fs.IntVar(&cfg.MaxStored, "max-stored-items", cfg.MaxStored, "maximum in-memory stored items")
 	fs.IntVar(&cfg.Concurrency, "max-concurrent-requests", cfg.Concurrency, "maximum Codex requests")
 	fs.BoolVar(&cfg.Verbose, "verbose", cfg.Verbose, "verbose logging")
+	fs.BoolVar(&cfg.AutoPromptCacheKey, "auto-prompt-cache-key", cfg.AutoPromptCacheKey, "generate stable prompt cache keys when omitted")
 	stopTimeout := cfg.StopTimeout.Seconds()
 	if command == "daemon-run" {
 		fs.Float64Var(&stopTimeout, "stop-timeout", stopTimeout, "seconds to wait before force kill")
@@ -148,9 +152,10 @@ func loadResolvedConfig(args []string) (config, string, error) {
 		configPath = os.Getenv("OPENAI_VIA_CODEX_CONFIG")
 	}
 	if configPath == "" {
-		home, _ := os.UserHomeDir()
-		configPath = filepath.Join(home, ".config", "openai-api-server-via-codex", "config.toml")
+		configPath = defaultConfigPath()
 	}
+	configPath = expandHome(configPath)
+	cfg.StateDir = filepath.Join(filepath.Dir(configPath), "run")
 	if err := cfg.applyConfigFile(configPath); err != nil {
 		return config{}, "", err
 	}
@@ -169,14 +174,14 @@ func runConfigGenerate(args []string) error {
 		}
 		return err
 	}
-	text := defaultConfigTOML()
+	if *path == "" {
+		*path = envString("OPENAI_VIA_CODEX_CONFIG", defaultConfigPath())
+	}
+	*path = expandHome(*path)
+	text := configTOML(filepath.Join(filepath.Dir(*path), "run"))
 	if *stdout {
 		fmt.Print(text)
 		return nil
-	}
-	if *path == "" {
-		home, _ := os.UserHomeDir()
-		*path = filepath.Join(home, ".config", "openai-api-server-via-codex", "config.toml")
 	}
 	if !*force {
 		if _, err := os.Stat(*path); err == nil {
@@ -190,11 +195,15 @@ func runConfigGenerate(args []string) error {
 }
 
 func defaultConfigTOML() string {
+	return configTOML(defaultStateDir())
+}
+
+func configTOML(stateDir string) string {
 	return fmt.Sprintf(`[server]
 host = %q
 port = %d
 default_model = %q
-timeout = 300.0
+timeout = 1800.0
 verbose = false
 max_stored_items = %d
 max_concurrent_requests = %d
@@ -206,19 +215,24 @@ client_version = %q
 
 [compat]
 drop_params = []
+auto_prompt_cache_key = true
 
 [daemon]
 state_dir = %q
 stop_timeout = 10.0
-`, defaultHost, defaultPort, defaultModel, defaultMaxStored, defaultConcurrency, defaultBackendURL, defaultClient, defaultStateDir())
+`, defaultHost, defaultPort, defaultModel, defaultMaxStored, defaultConcurrency, defaultBackendURL, defaultClient, stateDir)
+}
+
+func defaultConfigPath() string {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "openai-api-server-via-codex", "config.toml")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "openai-api-server-via-codex", "config.toml")
 }
 
 func defaultStateDir() string {
-	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
-		return filepath.Join(xdg, "openai-api-server-via-codex", "run")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "openai-api-server-via-codex", "run")
+	return filepath.Join(filepath.Dir(defaultConfigPath()), "run")
 }
 
 func configPathFromArgs(args []string) string {
@@ -271,7 +285,8 @@ type configFile struct {
 		ClientVersion  *string `toml:"client_version"`
 	} `toml:"codex"`
 	Compat struct {
-		DropParams []string `toml:"drop_params"`
+		DropParams         []string `toml:"drop_params"`
+		AutoPromptCacheKey *bool    `toml:"auto_prompt_cache_key"`
 	} `toml:"compat"`
 	Daemon struct {
 		StateDir    *string  `toml:"state_dir"`
@@ -317,6 +332,9 @@ func (file *configFile) apply(c *config) {
 	}
 	if file.Compat.DropParams != nil {
 		c.DropParams = append([]string(nil), file.Compat.DropParams...)
+	}
+	if file.Compat.AutoPromptCacheKey != nil {
+		c.AutoPromptCacheKey = *file.Compat.AutoPromptCacheKey
 	}
 	if file.Daemon.StateDir != nil {
 		c.StateDir = *file.Daemon.StateDir

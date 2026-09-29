@@ -40,8 +40,10 @@ func TestBackendReloadsExternalAuthAndRetriesStreamOnce(t *testing.T) {
 	}
 	var calls atomic.Int32
 	var authorizations []string
+	var requestIDs []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		requestIDs = append(requestIDs, r.Header.Get("x-client-request-id"))
 		if calls.Add(1) == 1 {
 			if err := replaceTestAuth(authPath, "access-new"); err != nil {
 				t.Error(err)
@@ -74,6 +76,9 @@ func TestBackendReloadsExternalAuthAndRetriesStreamOnce(t *testing.T) {
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("upstream calls = %d, want 2", calls.Load())
+	}
+	if len(requestIDs) != 2 || requestIDs[0] == "" || requestIDs[0] != requestIDs[1] {
+		t.Fatalf("401 retry changed the logical request ID: %v", requestIDs)
 	}
 	wantAuth := []string{"Bearer access-old", "Bearer access-new"}
 	if len(authorizations) != len(wantAuth) || authorizations[0] != wantAuth[0] || authorizations[1] != wantAuth[1] {

@@ -5,6 +5,25 @@ import (
 	"testing"
 )
 
+func TestChatUsageDoesNotInventMissingDetails(t *testing.T) {
+	for _, cached := range []any{nil, 0, 128} {
+		usage := map[string]any{"input_tokens": 256, "output_tokens": 20}
+		if cached != nil {
+			usage["input_tokens_details"] = map[string]any{"cached_tokens": cached}
+			usage["output_tokens_details"] = map[string]any{"reasoning_tokens": 0}
+		}
+		chat := responseToChat(map[string]any{"usage": usage}, defaultModel, false, 1)
+		converted := mapAny(chat["usage"])
+		if cached == nil {
+			if converted["prompt_tokens_details"] != nil || converted["completion_tokens_details"] != nil {
+				t.Fatal("missing details were invented")
+			}
+		} else if mapAny(converted["prompt_tokens_details"])["cached_tokens"] != cached || mapAny(converted["completion_tokens_details"])["reasoning_tokens"] != 0 {
+			t.Fatalf("usage = %v", converted)
+		}
+	}
+}
+
 func TestChatToResponseTranslatesMessagesToolsAndStructuredOutput(t *testing.T) {
 	body := map[string]any{
 		"model": "gpt-test",
@@ -85,5 +104,38 @@ func TestPrepareResponseNormalizesReasoningAndDefaults(t *testing.T) {
 	input := sliceAny(got["input"])
 	if len(input) != 1 || mapAny(input[0])["encrypted_content"] != "cipher" {
 		t.Fatalf("input = %#v", input)
+	}
+}
+
+func TestResponseContextPreservesEncryptedReasoningAndPhase(t *testing.T) {
+	output := []any{
+		map[string]any{"type": "reasoning", "id": "rs_original", "encrypted_content": "opaque-cipher", "summary": []any{map[string]any{"type": "summary_text", "text": "summary"}}},
+		map[string]any{"type": "message", "role": "assistant", "phase": "commentary", "content": []any{map[string]any{"type": "output_text", "text": "working"}}},
+		map[string]any{"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+	}
+	store := newResponseStore(2)
+	store.remember("resp_1", []any{map[string]any{"role": "user", "content": "hello"}}, map[string]any{"output": output})
+	context := store.get("resp_1").Context
+	if len(context) != 4 || mapAny(context[1])["encrypted_content"] != "opaque-cipher" || mapAny(context[1])["id"] != "rs_original" || mapAny(context[2])["phase"] != "commentary" || mapAny(context[3])["call_id"] != "call_1" {
+		t.Fatalf("reasoning, order, or phase was lost")
+	}
+	mapAny(context[1])["encrypted_content"] = "changed"
+	if mapAny(store.get("resp_1").Context[1])["encrypted_content"] != "opaque-cipher" {
+		t.Fatal("stored reasoning was mutated")
+	}
+}
+
+func TestReplayPreservesEveryNativeOutputField(t *testing.T) {
+	native := []any{
+		map[string]any{"type": "reasoning", "id": "rs_1", "status": "completed", "encrypted_content": "cipher", "content": []any{}, "summary": []any{map[string]any{"type": "summary_text", "text": "summary"}}},
+		map[string]any{"type": "message", "id": "msg_1", "status": "completed", "role": "assistant", "phase": "final_answer", "content": []any{map[string]any{"type": "output_text", "text": "\n\nanswer", "annotations": []any{}}}},
+		map[string]any{"type": "function_call", "id": "fc_1", "status": "completed", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+	}
+	for _, replay := range []any{normalizeResponseInput(native), responseContext(map[string]any{"output": native})} {
+		want, _ := json.Marshal(native)
+		got, _ := json.Marshal(replay)
+		if string(want) != string(got) {
+			t.Fatal("native output fields were changed during replay")
+		}
 	}
 }

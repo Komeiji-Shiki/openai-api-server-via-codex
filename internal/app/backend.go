@@ -14,6 +14,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 )
 
 var defaultModels = []string{"gpt-5.1", "gpt-5.1-codex-max", "gpt-5.1-codex-mini", "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
@@ -34,7 +35,11 @@ type backendError struct {
 func (e *backendError) Error() string { return e.Message }
 
 func newBackend(cfg config) *backend {
-	client := &http.Client{Timeout: cfg.Timeout}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = cfg.Timeout
+	// A total http.Client timeout would abort a healthy long-running stream.
+	// Stream reads are bounded by idleTimeoutBody below instead.
+	client := &http.Client{Transport: transport}
 	return &backend{
 		cfg:    cfg,
 		client: client,
@@ -45,7 +50,7 @@ func newBackend(cfg config) *backend {
 	}
 }
 
-func (b *backend) headers(cred credentials, stream bool, requestID string) http.Header {
+func (b *backend) headers(cred credentials, stream bool, cacheKey string) http.Header {
 	h := make(http.Header)
 	h.Set("Authorization", "Bearer "+cred.AccessToken)
 	h.Set("originator", "openai-api-server-via-codex")
@@ -58,9 +63,8 @@ func (b *backend) headers(cred credentials, stream bool, requestID string) http.
 		h.Set("Content-Type", "application/json")
 		h.Set("OpenAI-Beta", "responses=experimental")
 	}
-	if requestID != "" {
-		h.Set("session_id", requestID)
-		h.Set("x-client-request-id", requestID)
+	if cacheKey != "" {
+		h.Set("session_id", cacheKey)
 	}
 	return h
 }
@@ -113,6 +117,9 @@ func logAuthFailure(stage string, err error) {
 func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(map[string]any) error) error {
 	b.debugf("codex.stream.start model=%s endpoint=%s/responses", stringValue(payload["model"]), b.cfg.BackendURL)
 	prepared := cloneMap(payload)
+	if _, provided := prepared["prompt_cache_key"]; !provided && b.cfg.AutoPromptCacheKey {
+		prepared["prompt_cache_key"] = defaultPromptCacheKey(prepared)
+	}
 	for _, name := range b.cfg.DropParams {
 		delete(prepared, name)
 	}
@@ -138,12 +145,14 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 	}
 	prepared["include"] = include
 	body, _ := json.Marshal(prepared)
+	requestID := newID("req")
 	resp, err := b.doAuthenticated(func(cred credentials) (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.BackendURL+"/responses", bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
 		req.Header = b.headers(cred, true, stringValue(prepared["prompt_cache_key"]))
+		req.Header.Set("x-client-request-id", requestID)
 		return req, nil
 	})
 	if err != nil {
@@ -158,9 +167,10 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 	if resp.StatusCode/100 != 2 {
 		return decodeBackendError(resp)
 	}
-	reader := bufio.NewReaderSize(resp.Body, 64*1024)
+	reader := bufio.NewReaderSize(&idleTimeoutBody{ReadCloser: resp.Body, timeout: b.cfg.Timeout}, 64*1024)
 	var data strings.Builder
 	events := 0
+	terminal := false
 	flush := func() error {
 		if data.Len() == 0 {
 			return nil
@@ -175,6 +185,13 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 			return nil
 		}
 		normalizeBackendEvent(event)
+		switch event["type"] {
+		case "response.completed", "response.incomplete", "response.failed":
+			if mapAny(event["response"]) == nil {
+				return &backendError{502, "Codex backend returned an invalid terminal response."}
+			}
+			terminal = true
+		}
 		events++
 		return fn(event)
 	}
@@ -182,6 +199,9 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 		line, readErr := readSSELine(reader, maxSSEEventBytes)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			b.debugf("codex.stream.error message=%s", redactSensitive(readErr.Error()))
+			if strings.Contains(readErr.Error(), "idle timeout") {
+				return &backendError{502, readErr.Error()}
+			}
 			return readErr
 		}
 		if line == "" {
@@ -210,8 +230,40 @@ func (b *backend) stream(ctx context.Context, payload map[string]any, fn func(ma
 	if err := flush(); err != nil {
 		return err
 	}
+	if !terminal {
+		return &backendError{502, "Codex backend stream ended before a terminal response."}
+	}
 	b.debugf("codex.stream.end events=%d", events)
 	return nil
+}
+
+type idleTimeoutBody struct {
+	io.ReadCloser
+	timeout time.Duration
+}
+
+func (r *idleTimeoutBody) Read(p []byte) (int, error) {
+	if r.timeout <= 0 {
+		return r.ReadCloser.Read(p)
+	}
+	type result struct {
+		n   int
+		err error
+	}
+	completed := make(chan result, 1)
+	go func() {
+		n, err := r.ReadCloser.Read(p)
+		completed <- result{n: n, err: err}
+	}()
+	timer := time.NewTimer(r.timeout)
+	defer timer.Stop()
+	select {
+	case value := <-completed:
+		return value.n, value.err
+	case <-timer.C:
+		_ = r.ReadCloser.Close()
+		return 0, fmt.Errorf("Codex backend stream idle timeout after %s", r.timeout)
+	}
 }
 
 func readSSELine(reader *bufio.Reader, limit int) (string, error) {
@@ -260,16 +312,8 @@ func validResponseStatus(status string) bool {
 func (b *backend) collect(ctx context.Context, payload map[string]any) (map[string]any, error) {
 	var completed map[string]any
 	var output []any
-	var text strings.Builder
-	var responseID string
 	err := b.stream(ctx, payload, func(event map[string]any) error {
 		switch event["type"] {
-		case "response.created":
-			if r := mapAny(event["response"]); r != nil {
-				responseID = stringValue(r["id"])
-			}
-		case "response.output_text.delta":
-			text.WriteString(stringValue(event["delta"]))
 		case "response.output_item.done":
 			if item := mapAny(event["item"]); item != nil {
 				output = append(output, item)
@@ -293,10 +337,7 @@ func (b *backend) collect(ctx context.Context, payload map[string]any) (map[stri
 		}
 		return completed, nil
 	}
-	if responseID == "" {
-		responseID = newID("resp")
-	}
-	return map[string]any{"id": responseID, "object": "response", "created_at": nowFloat(), "status": "completed", "model": payload["model"], "output": []any{outputMessage(text.String())}, "parallel_tool_calls": true, "tool_choice": valueOr(payload["tool_choice"], "auto"), "tools": sliceAny(payload["tools"])}, nil
+	return nil, &backendError{502, "Codex backend stream ended before a terminal response."}
 }
 
 func (b *backend) listModels(ctx context.Context) []string {

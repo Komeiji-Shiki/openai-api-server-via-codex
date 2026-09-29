@@ -189,7 +189,7 @@ func TestGoHTTPContractResponsesLifecycleAndStreaming(t *testing.T) {
 	if !containsString(sliceAny(upstream.JSON["include"]), "reasoning.encrypted_content") {
 		t.Fatalf("upstream include = %#v", upstream.JSON["include"])
 	}
-	if upstream.Headers.Get("session_id") != "go-contract-request" || upstream.Headers.Get("x-client-request-id") != "go-contract-request" {
+	if upstream.Headers.Get("session_id") != "go-contract-request" || upstream.Headers.Get("x-client-request-id") == "" || upstream.Headers.Get("x-client-request-id") == "go-contract-request" {
 		t.Fatalf("upstream headers = %#v", upstream.Headers)
 	}
 	if upstream.Headers.Get("ChatGPT-Account-ID") != "acct_go_test" || upstream.Headers.Get("Authorization") == "Bearer "+contractAPIKey {
@@ -454,13 +454,13 @@ func TestGoHTTPContractImagesAudioProxyAndErrors(t *testing.T) {
 	}
 }
 
-func TestGoHTTPContractCollectFallbackFailureAndNormalization(t *testing.T) {
+func TestGoHTTPContractRejectsTruncationAndNormalizesTerminalEvents(t *testing.T) {
 	environment := newContractEnvironment(t, nil)
-	fallback := environment.json(t, http.MethodPost, "/v1/responses", map[string]any{
+	truncated := environment.json(t, http.MethodPost, "/v1/responses", map[string]any{
 		"model": "gpt-5.6-luna", "input": "FAKE_DELTA_ONLY",
-	}, http.StatusOK)
-	if fallback["status"] != "completed" || !strings.Contains(responseText(fallback), "FAKE_DELTA_ONLY") {
-		t.Fatalf("fallback response = %#v", fallback)
+	}, http.StatusBadGateway)
+	if !strings.Contains(stringValue(mapAny(truncated["error"])["message"]), "before a terminal response") {
+		t.Fatalf("truncated response = %#v", truncated)
 	}
 	normalized := environment.json(t, http.MethodPost, "/v1/responses", map[string]any{
 		"model": "gpt-5.6-luna", "input": "FAKE_RAW_DONE",

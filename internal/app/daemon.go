@@ -80,6 +80,7 @@ func addDaemonServerFlags(fs *flag.FlagSet, cfg *config) *float64 {
 	fs.Float64Var(&timeout, "timeout", timeout, "backend timeout seconds")
 	fs.IntVar(&cfg.MaxStored, "max-stored-items", cfg.MaxStored, "maximum in-memory stored items")
 	fs.IntVar(&cfg.Concurrency, "max-concurrent-requests", cfg.Concurrency, "maximum Codex requests")
+	fs.BoolVar(&cfg.AutoPromptCacheKey, "auto-prompt-cache-key", cfg.AutoPromptCacheKey, "generate stable prompt cache keys when omitted")
 	return &timeout
 }
 
@@ -190,6 +191,7 @@ func startDaemon(cfg config, paths daemonPaths) error {
 
 func serverCommandArgs(command string, cfg config) []string {
 	args := []string{command, "--host", cfg.Host, "--port", strconv.Itoa(cfg.Port), "--backend-base-url", cfg.BackendURL, "--client-version", cfg.ClientVersion, "--auth-json", cfg.AuthJSON, "--timeout", formatSeconds(cfg.Timeout), "--max-stored-items", strconv.Itoa(cfg.MaxStored), "--max-concurrent-requests", strconv.Itoa(cfg.Concurrency), "--default-model", cfg.Model}
+	args = append(args, "--auto-prompt-cache-key="+strconv.FormatBool(cfg.AutoPromptCacheKey))
 	if command == "daemon-run" {
 		args = append(args, "--stop-timeout", formatSeconds(cfg.StopTimeout))
 	}

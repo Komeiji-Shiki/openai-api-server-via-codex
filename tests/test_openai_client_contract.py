@@ -10,11 +10,21 @@ import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import httpx
 import pytest
-from openai import AsyncOpenAI, ConflictError, NotFoundError
+from openai import (
+    APIError,
+    AsyncOpenAI,
+    AsyncStream,
+    ConflictError,
+    InternalServerError,
+    NotFoundError,
+    OpenAI,
+)
+from openai.types.chat import ChatCompletionChunk
+from openai.types.responses import ResponseCompletedEvent, ResponseStreamEvent
 
 
 def _free_port() -> int:
@@ -32,7 +42,9 @@ def _flatten_text(value: Any) -> str:
         if value.get("type") in {"input_text", "output_text", "text"}:
             return str(value.get("text") or "")
         return " ".join(
-            filter(None, (_flatten_text(value.get(key)) for key in ("content", "input")))
+            filter(
+                None, (_flatten_text(value.get(key)) for key in ("content", "input"))
+            )
         )
     return ""
 
@@ -40,6 +52,8 @@ def _flatten_text(value: Any) -> str:
 class _FakeCodexHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     counter = 0
+    last_payload: ClassVar[dict[str, Any]] = {}
+    last_headers: ClassVar[dict[str, str]] = {}
 
     def log_message(self, format: str, *args: Any) -> None:
         del format, args
@@ -69,6 +83,8 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
         if self.path == "/backend-api/codex/responses":
             size = int(self.headers.get("content-length", "0"))
             payload = json.loads(self.rfile.read(size))
+            type(self).last_payload = payload
+            type(self).last_headers = dict(self.headers.items())
             self._responses_stream(payload)
             return
         if self.path == "/backend-api/transcribe":
@@ -115,9 +131,7 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
                 "role": "assistant",
                 "status": "completed",
                 "phase": "final_answer",
-                "content": [
-                    {"type": "output_text", "text": text, "annotations": []}
-                ],
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
             }
         response = {
             "id": response_id,
@@ -129,8 +143,24 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
             "parallel_tool_calls": True,
             "tool_choice": payload.get("tool_choice", "auto"),
             "tools": tools,
-            "usage": {"input_tokens": 3, "output_tokens": 5, "total_tokens": 8},
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 5,
+                "total_tokens": 8,
+                "input_tokens_details": {"cached_tokens": 2},
+                "output_tokens_details": {"reasoning_tokens": 1},
+            },
         }
+        if "CONTRACT-REASONING" in _flatten_text(payload.get("input")):
+            response["output"].insert(
+                0,
+                {
+                    "type": "reasoning",
+                    "id": "rs_contract",
+                    "summary": [],
+                    "encrypted_content": "opaque-contract-cipher",
+                },
+            )
         created_response = {**response, "status": "in_progress", "output": []}
         events: list[dict[str, Any]] = [
             {
@@ -187,10 +217,15 @@ class _FakeCodexHandler(BaseHTTPRequestHandler):
                 },
             ]
         )
-        chunks = "".join(
-            f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
-            for event in events
-        ) + "data: [DONE]\n\n"
+        if "CONTRACT-TRUNCATE" in _flatten_text(payload.get("input")):
+            events = [e for e in events if e["type"] != "response.completed"]
+        chunks = (
+            "".join(
+                f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+                for event in events
+            )
+            + "data: [DONE]\n\n"
+        )
         encoded = chunks.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -288,20 +323,23 @@ def runtime_server(
         "--api-key",
         "contract-server-key",
     ]
-    process = subprocess.Popen(
-        command,
-        cwd=Path(__file__).parents[1],
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    log_path = work / "server.log"
+    # An unread PIPE fills during larger contract suites and blocks Go logs.
+    with log_path.open("w", encoding="utf-8") as server_log:
+        process = subprocess.Popen(
+            command,
+            cwd=Path(__file__).parents[1],
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
     base_url = f"http://127.0.0.1:{port}"
     try:
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                output = process.stdout.read() if process.stdout else ""
+                output = log_path.read_text(encoding="utf-8", errors="replace")
                 raise AssertionError(f"{runtime} server exited early:\n{output}")
             try:
                 if httpx.get(f"{base_url}/healthz", timeout=0.2).status_code == 200:
@@ -324,6 +362,135 @@ def runtime_server(
 def contract_client(runtime_server: tuple[str, str]) -> AsyncOpenAI:
     _, base_url = runtime_server
     return AsyncOpenAI(api_key="contract-server-key", base_url=f"{base_url}/v1")
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_contract_chat_cache_key_and_usage(
+    contract_client: AsyncOpenAI,
+    streaming: bool,
+) -> None:
+    async with contract_client as client:
+        result = await client.chat.completions.create(
+            model="gpt-5.6-luna",
+            messages=[{"role": "user", "content": "cache metrics"}],
+            prompt_cache_key="sdk-cache-session",
+            stream=streaming,
+            stream_options={"include_usage": True} if streaming else None,
+        )
+        if isinstance(result, AsyncStream):
+            chunks = [
+                chunk async for chunk in cast(AsyncStream[ChatCompletionChunk], result)
+            ]
+            usage = next(chunk.usage for chunk in chunks if chunk.usage is not None)
+        else:
+            usage = result.usage
+        assert usage is not None
+        assert usage.prompt_tokens_details is not None
+        assert usage.completion_tokens_details is not None
+        assert usage.prompt_tokens_details.cached_tokens == 2
+        assert usage.completion_tokens_details.reasoning_tokens == 1
+        assert usage.total_tokens == 8
+        assert _FakeCodexHandler.last_payload["prompt_cache_key"] == "sdk-cache-session"
+
+
+def test_contract_sync_responses_cache_key_and_usage(
+    runtime_server: tuple[str, str],
+) -> None:
+    _, base_url = runtime_server
+    with OpenAI(api_key="contract-server-key", base_url=f"{base_url}/v1") as client:
+        first = client.responses.create(model="gpt-5.6-luna", input="cache first")
+        key = _FakeCodexHandler.last_payload["prompt_cache_key"]
+        headers = {k.lower(): v for k, v in _FakeCodexHandler.last_headers.items()}
+        assert key.startswith("auto_")
+        assert first.usage is not None
+        assert first.usage.input_tokens_details.cached_tokens == 2
+        client.responses.create(
+            model="gpt-5.6-luna", previous_response_id=first.id, input="followup"
+        )
+        assert _FakeCodexHandler.last_payload["prompt_cache_key"] == key
+        next_headers = {k.lower(): v for k, v in _FakeCodexHandler.last_headers.items()}
+        assert headers["session_id"] == next_headers["session_id"] == key
+        assert headers["x-client-request-id"] != next_headers["x-client-request-id"]
+        client.responses.create(
+            model="gpt-5.6-luna", input="explicit", prompt_cache_key="explicit-response"
+        )
+        assert _FakeCodexHandler.last_payload["prompt_cache_key"] == "explicit-response"
+
+
+@pytest.mark.parametrize("endpoint", ["responses", "chat"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_contract_truncated_stream_is_not_success(
+    contract_client: AsyncOpenAI,
+    endpoint: str,
+    streaming: bool,
+) -> None:
+    async with contract_client.with_options(max_retries=0) as client:
+        if not streaming:
+            with pytest.raises(InternalServerError, match="before a terminal response"):
+                if endpoint == "responses":
+                    await client.responses.create(
+                        model="gpt-5.6-luna", input="CONTRACT-TRUNCATE"
+                    )
+                else:
+                    await client.chat.completions.create(
+                        model="gpt-5.6-luna",
+                        messages=[{"role": "user", "content": "CONTRACT-TRUNCATE"}],
+                    )
+        elif endpoint == "responses":
+            stream = await client.responses.create(
+                model="gpt-5.6-luna", input="CONTRACT-TRUNCATE", stream=True
+            )
+            events = [event async for event in stream]
+            assert any(
+                e.type == "error"
+                and "before a terminal response" in str(e.model_dump().get("message"))
+                for e in events
+            )
+            assert not any(e.type == "response.completed" for e in events)
+        else:
+            stream = await client.chat.completions.create(
+                model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "CONTRACT-TRUNCATE"}],
+                stream=True,
+            )
+            with pytest.raises(APIError, match="before a terminal response"):
+                async for chunk in stream:
+                    assert not any(choice.finish_reason for choice in chunk.choices)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_contract_previous_response_restores_encrypted_reasoning(
+    contract_client: AsyncOpenAI,
+    streaming: bool,
+) -> None:
+    async with contract_client as client:
+        result = await client.responses.create(
+            model="gpt-5.6-luna", input="CONTRACT-REASONING", stream=streaming
+        )
+        if isinstance(result, AsyncStream):
+            events = [
+                event async for event in cast(AsyncStream[ResponseStreamEvent], result)
+            ]
+            first = next(
+                event.response
+                for event in events
+                if isinstance(event, ResponseCompletedEvent)
+            )
+        else:
+            first = result
+        await client.responses.create(
+            model="gpt-5.6-luna", input="next", previous_response_id=first.id
+        )
+        items = _FakeCodexHandler.last_payload["input"]
+        assert items[1]["type"] == "reasoning"
+        assert items[1]["id"] == "rs_contract"
+        assert items[1]["encrypted_content"] == "opaque-contract-cipher"
+        assert items[2]["role"] == "assistant"
+        assert items[2]["phase"] == "final_answer"
+        assert items[2]["type"] == "message"
+        assert items[2]["status"] == "completed"
+        assert items[2]["id"].startswith("msg_contract_")
+        assert items[-1]["content"] == "next"
 
 
 async def test_contract_health_and_models(runtime_server: tuple[str, str]) -> None:
@@ -355,9 +522,9 @@ async def test_contract_health_and_models(runtime_server: tuple[str, str]) -> No
     assert root.status_code == 307, runtime
     assert root.headers["location"].endswith("/v1/"), runtime
     assert root_with_slash.status_code == 200, runtime
-    assert root_with_slash.json()["request_path"].endswith(
-        "/backend-api/codex/"
-    ), runtime
+    assert root_with_slash.json()["request_path"].endswith("/backend-api/codex/"), (
+        runtime
+    )
 
 
 async def test_contract_responses_lifecycle_and_streaming(
@@ -444,13 +611,13 @@ async def test_contract_chat_lifecycle_streaming_and_tools(
         store=True,
         metadata={"suite": "contract"},
     )
-    assert "chat lifecycle marker" in (completion.choices[0].message.content or ""), runtime
+    assert "chat lifecycle marker" in (completion.choices[0].message.content or ""), (
+        runtime
+    )
 
     retrieved = await contract_client.chat.completions.retrieve(completion.id)
     assert retrieved.id == completion.id, runtime
-    listed = await contract_client.chat.completions.list(
-        metadata={"suite": "contract"}
-    )
+    listed = await contract_client.chat.completions.list(metadata={"suite": "contract"})
     assert completion.id in [item.id for item in listed.data], runtime
     updated = await contract_client.chat.completions.update(
         completion.id, metadata={"suite": "updated"}
@@ -490,9 +657,9 @@ async def test_contract_chat_lifecycle_streaming_and_tools(
         )
         for index in (0, 1)
     }
-    assert all(
-        "chat stream marker" in text for text in streamed_by_choice.values()
-    ), runtime
+    assert all("chat stream marker" in text for text in streamed_by_choice.values()), (
+        runtime
+    )
     assert any(chunk.usage is not None for chunk in chunks), runtime
 
     tool = await contract_client.chat.completions.create(
@@ -542,7 +709,9 @@ async def test_contract_images_audio_and_unknown_proxy(
         base_url=base_url, headers={"Authorization": "Bearer contract-server-key"}
     ) as direct:
         proxied = await direct.get("/v1/batches?limit=3")
-        encoded_delimiters = await direct.get("/v1/files/report%3Fformat%23section?limit=1")
+        encoded_delimiters = await direct.get(
+            "/v1/files/report%3Fformat%23section?limit=1"
+        )
         literal_percent = await direct.get("/v1/files/100%25done")
         encoded_traversal = await direct.get("/v1/files/%2e%2e/auth")
     assert proxied.json()["object"] == "list", runtime

@@ -112,17 +112,18 @@ func normalizeInputItem(value any) any {
 		if stringValue(item["encrypted_content"]) == "" {
 			return nil
 		}
-		return map[string]any{"type": "reasoning", "encrypted_content": item["encrypted_content"], "summary": sliceAny(item["summary"])}
+		result := cloneMap(item)
+		setDefault(result, "summary", []any{})
+		return result
 	case "message":
 		if item["role"] == "assistant" {
-			result := map[string]any{"role": "assistant", "content": messageText(item)}
-			if item["phase"] != nil {
-				result["phase"] = item["phase"]
-			}
-			return result
+			return cloneMap(item)
 		}
 	case "function_call":
-		return map[string]any{"type": "function_call", "call_id": valueOr(item["call_id"], item["id"]), "name": item["name"], "arguments": valueOr(item["arguments"], "{}")}
+		result := cloneMap(item)
+		result["call_id"] = valueOr(item["call_id"], item["id"])
+		setDefault(result, "arguments", "{}")
+		return result
 	case "function_call_output":
 		return map[string]any{"type": "function_call_output", "call_id": valueOr(item["call_id"], "unknown"), "output": stringValue(item["output"])}
 	}
@@ -184,6 +185,9 @@ func chatToResponse(body map[string]any, model string) map[string]any {
 		if body[key] != nil {
 			result[key] = body[key]
 		}
+	}
+	if key, ok := body["prompt_cache_key"]; ok {
+		result["prompt_cache_key"] = key
 	}
 	if body["max_completion_tokens"] != nil {
 		result["max_output_tokens"] = body["max_completion_tokens"]
@@ -418,20 +422,25 @@ func responseToChat(response map[string]any, fallback string, legacy bool, n int
 	if created == 0 {
 		created = int(time.Now().Unix())
 	}
-	return map[string]any{"id": id, "object": "chat.completion", "created": created, "model": stringValue(valueOr(response["model"], fallback)), "choices": choices, "usage": map[string]any{"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}}
+	chatUsage := map[string]any{"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+	if details := mapAny(usage["input_tokens_details"]); details != nil && details["cached_tokens"] != nil {
+		chatUsage["prompt_tokens_details"] = map[string]any{"cached_tokens": details["cached_tokens"]}
+	}
+	if details := mapAny(usage["output_tokens_details"]); details != nil && details["reasoning_tokens"] != nil {
+		chatUsage["completion_tokens_details"] = map[string]any{"reasoning_tokens": details["reasoning_tokens"]}
+	}
+	return map[string]any{"id": id, "object": "chat.completion", "created": created, "model": stringValue(valueOr(response["model"], fallback)), "choices": choices, "usage": chatUsage}
 }
 
 func responseContext(response map[string]any) []any {
 	var result []any
 	for _, raw := range sliceAny(response["output"]) {
 		item := mapAny(raw)
-		switch item["type"] {
-		case "function_call":
-			result = append(result, map[string]any{"type": "function_call", "call_id": valueOr(item["call_id"], item["id"]), "name": item["name"], "arguments": valueOr(item["arguments"], "{}")})
-		case "message":
-			if text := messageText(item); text != "" {
-				result = append(result, map[string]any{"role": "assistant", "content": text})
-			}
+		if item == nil {
+			continue
+		}
+		if normalized := normalizeInputItem(item); normalized != nil {
+			result = append(result, normalized)
 		}
 	}
 	if len(result) == 0 {

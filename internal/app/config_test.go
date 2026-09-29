@@ -1,12 +1,95 @@
 package app
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestPromptCacheConfigAndDaemonPropagation(t *testing.T) {
+	cfg := defaultConfig()
+	if !cfg.AutoPromptCacheKey {
+		t.Fatal("automatic prompt keys must default on")
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[compat]\nauto_prompt_cache_key = false\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.applyConfigFile(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AutoPromptCacheKey {
+		t.Fatal("config false ignored")
+	}
+	t.Setenv("OPENAI_VIA_CODEX_AUTO_PROMPT_CACHE_KEY", "true")
+	cfg.applyEnvironment()
+	if !cfg.AutoPromptCacheKey {
+		t.Fatal("environment override ignored")
+	}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	addDaemonServerFlags(fs, &cfg)
+	if err := fs.Parse([]string{"--auto-prompt-cache-key=false"}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AutoPromptCacheKey {
+		t.Fatal("CLI false ignored")
+	}
+	for _, enabled := range []bool{false, true} {
+		cfg.AutoPromptCacheKey = enabled
+		for _, command := range []string{"serve", "daemon-run"} {
+			args := serverCommandArgs(command, cfg)
+			want := "--auto-prompt-cache-key=false"
+			if enabled {
+				want = "--auto-prompt-cache-key=true"
+			}
+			if !strings.Contains(strings.Join(args, " "), want) {
+				t.Fatalf("child args missing %s", want)
+			}
+		}
+	}
+}
+
+func TestConfigPathsAndGenerationRespectXDGAndOverrides(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("OPENAI_VIA_CODEX_CONFIG", "")
+	t.Setenv("OPENAI_VIA_CODEX_STATE_DIR", "")
+	if err := runConfigGenerate(nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, path, err := loadResolvedConfig(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "openai-api-server-via-codex", "config.toml")
+	if path != want || cfg.StateDir != filepath.Join(filepath.Dir(want), "run") {
+		t.Fatalf("resolved path=%q state=%q", path, cfg.StateDir)
+	}
+	custom := filepath.Join(t.TempDir(), "custom.toml")
+	t.Setenv("OPENAI_VIA_CODEX_CONFIG", custom)
+	if err := runConfigGenerate(nil); err != nil {
+		t.Fatal(err)
+	}
+	_, path, err = loadResolvedConfig(nil)
+	if err != nil || path != custom {
+		t.Fatalf("env path=%q err=%v", path, err)
+	}
+	cli := filepath.Join(t.TempDir(), "cli.toml")
+	if err := os.WriteFile(cli, []byte("[server]\nport = 19100\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, path, err = loadResolvedConfig([]string{"--config", cli})
+	if err != nil || path != cli || cfg.StateDir != filepath.Join(filepath.Dir(cli), "run") || cfg.Port != 19100 {
+		t.Fatalf("CLI path=%q state=%q err=%v", path, cfg.StateDir, err)
+	}
+	t.Setenv("OPENAI_VIA_CODEX_STATE_DIR", "custom-state")
+	cfg, _, err = loadResolvedConfig([]string{"--config", cli})
+	if err != nil || cfg.StateDir != "custom-state" {
+		t.Fatalf("state=%q err=%v", cfg.StateDir, err)
+	}
+}
 
 func TestApplyConfigFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")

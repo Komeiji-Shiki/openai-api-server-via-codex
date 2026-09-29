@@ -6,6 +6,8 @@ import os
 import socket
 import subprocess
 import tempfile
+import time
+import uuid
 from pathlib import Path
 from typing import Any, cast
 
@@ -22,6 +24,100 @@ RED_SQUARE_PNG_DATA_URL = (
     "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC"
 )
 LIVE_LONG_TEST_MODEL = "gpt-5.4-mini"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.environ.get("RUN_CODEX_LIVE_TESTS") != "1",
+    reason="Set RUN_CODEX_LIVE_TESTS=1 to measure real Codex prompt caching.",
+)
+async def test_live_codex_prompt_cache_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = os.environ.get("OPENAI_VIA_CODEX_TEST_MODEL", "gpt-5.6-luna")
+    for automatic in (False, True):
+        monkeypatch.setenv(
+            "OPENAI_VIA_CODEX_AUTO_PROMPT_CACHE_KEY", str(automatic).lower()
+        )
+        server = await _start_server()
+        marker = "CACHE-OK-" + uuid.uuid4().hex[:12]
+        # Separate each experiment at the beginning to avoid warming the other.
+        instructions = f"Experiment {marker}. Reply with exactly {marker}."
+        reference = "\n".join(
+            f"Reference {i:04d}: the archive contains a stable observation of stars and planets."
+            for i in range(220)
+        )
+        prompt = reference + f"\nReply with exactly {marker}."
+        try:
+            async with AsyncOpenAI(
+                api_key="test", base_url=f"{server.base_url}/v1", max_retries=0
+            ) as client:
+                previous_id = None
+                for stage in ("cold", "repeat", "followup"):
+                    started = time.monotonic()
+                    kwargs: dict[str, Any] = {}
+                    if stage == "followup":
+                        kwargs["previous_response_id"] = previous_id
+                    response = await client.responses.create(
+                        model=model,
+                        instructions=instructions,
+                        input=f"Repeat the exact experiment marker {marker}."
+                        if stage == "followup"
+                        else prompt,
+                        reasoning={"effort": "low"},
+                        **kwargs,
+                    )
+                    assert response.status == "completed"
+                    assert marker in response.output_text
+                    assert response.usage is not None
+                    print(
+                        json.dumps(
+                            {
+                                "auto_key": automatic,
+                                "stage": stage,
+                                "seconds": round(time.monotonic() - started, 3),
+                                "usage": response.usage.model_dump(),
+                                "output": response.output_text,
+                            },
+                            ensure_ascii=True,
+                        ),
+                        flush=True,
+                    )
+                    previous_id = response.id
+                chat = await client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": instructions},
+                        {"role": "user", "content": prompt},
+                    ],
+                    reasoning_effort="low",
+                    stream=True,
+                    stream_options={"include_usage": True},
+                )
+                text_parts: list[str] = []
+                usage = None
+                finished = False
+                async for chunk in chat:
+                    if chunk.choices:
+                        text_parts.append(chunk.choices[0].delta.content or "")
+                        finished |= chunk.choices[0].finish_reason is not None
+                    if chunk.usage is not None:
+                        usage = chunk.usage
+                assert marker in "".join(text_parts) and finished
+                assert usage is not None and usage.prompt_tokens_details is not None
+                assert usage.prompt_tokens_details.cached_tokens is not None
+                print(
+                    json.dumps(
+                        {
+                            "auto_key": automatic,
+                            "stage": "chat_stream",
+                            "usage": usage.model_dump(),
+                            "output": "".join(text_parts),
+                        },
+                        ensure_ascii=True,
+                    ),
+                    flush=True,
+                )
+        finally:
+            await server.stop()
 
 
 @pytest.mark.asyncio
@@ -68,7 +164,10 @@ async def test_live_codex_http_supports_openai_calls() -> None:
                 model=model,
                 messages=[
                     {"role": "system", "content": "Answer with concise text only."},
-                    {"role": "user", "content": "Reply with exactly: codex-http-chat-ok"},
+                    {
+                        "role": "user",
+                        "content": "Reply with exactly: codex-http-chat-ok",
+                    },
                 ],
                 reasoning_effort="low",
             )
@@ -302,20 +401,23 @@ async def _start_server() -> _RunningServer:
         check=True,
     )
     command = [str(binary)]
-    process = subprocess.Popen(
-        [
-            *command,
-            "serve",
-            "--host",
-            host,
-            "--port",
-            str(port),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env,
-    )
+    with (Path(build_dir.name) / "server.log").open(
+        "w", encoding="utf-8"
+    ) as server_log:
+        process = subprocess.Popen(
+            [
+                *command,
+                "serve",
+                "--host",
+                host,
+                "--port",
+                str(port),
+            ],
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+        )
     server = _RunningServer(process, base_url, build_dir)
     try:
         await _wait_for_server(base_url)
@@ -391,7 +493,10 @@ async def _assert_chat_multi_turn_with_reasoning(
                 "content": f"Remember this exact marker: {marker}. Reply with ready.",
             },
             {"role": "assistant", "content": first_message},
-            {"role": "user", "content": "Return the exact marker I asked you to remember."},
+            {
+                "role": "user",
+                "content": "Return the exact marker I asked you to remember.",
+            },
         ],
         reasoning_effort="high",
     )
@@ -616,10 +721,7 @@ async def _assert_chat_multi_turn_tool_calling(
         backend_name,
         tool_call_data,
     )
-    print(
-        f"{backend_name} chat tool call: "
-        f"name={tool_name} args={tool_arguments_text}"
-    )
+    print(f"{backend_name} chat tool call: name={tool_name} args={tool_arguments_text}")
 
     second = await client.chat.completions.create(
         model=model,
@@ -734,8 +836,7 @@ async def _assert_long_plain_text_responses_conversation(
             "marker strings exactly."
         ),
         input=(
-            f"Remember marker one: {markers[0]}. "
-            "Reply with a short acknowledgement."
+            f"Remember marker one: {markers[0]}. Reply with a short acknowledgement."
         ),
         reasoning={"effort": "low"},
     )
@@ -744,8 +845,7 @@ async def _assert_long_plain_text_responses_conversation(
     second = await client.responses.create(
         model=model,
         input=(
-            f"Add marker two: {markers[1]}. "
-            "List the markers you know so far in order."
+            f"Add marker two: {markers[1]}. List the markers you know so far in order."
         ),
         previous_response_id=first.id,
         reasoning={"effort": "low"},
@@ -955,10 +1055,7 @@ async def _assert_responses_manual_context_without_previous_response_id(
         reasoning={"effort": "low"},
     )
     _assert_response_api_shape(second, backend_name)
-    print(
-        f"{backend_name} responses manual context: "
-        f"{_short_text(second.output_text)}"
-    )
+    print(f"{backend_name} responses manual context: {_short_text(second.output_text)}")
     assert _contains_marker(second.output_text, marker), (
         backend_name,
         second.output_text,
@@ -1563,9 +1660,7 @@ async def _assert_chat_streaming_tool_call(
     )
 
 
-def _assert_sync_client_smoke(
-    base_url: str, model: str, backend_name: str
-) -> None:
+def _assert_sync_client_smoke(base_url: str, model: str, backend_name: str) -> None:
     client = OpenAI(api_key="test", base_url=f"{base_url}/v1")
     try:
         response = client.responses.create(
@@ -1588,9 +1683,7 @@ def _assert_sync_client_smoke(
             reasoning_effort="low",
         )
         _assert_chat_api_shape(chat, backend_name)
-        print(
-            f"{backend_name} sync responses: {_short_text(response.output_text)}"
-        )
+        print(f"{backend_name} sync responses: {_short_text(response.output_text)}")
         print(
             f"{backend_name} sync chat: "
             f"{_short_text(chat.choices[0].message.content or '')}"

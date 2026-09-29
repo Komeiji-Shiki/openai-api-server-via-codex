@@ -61,9 +61,9 @@ func serve(cfg config, version string) error {
 	log.Print(startupLogMessage(version, boundAddress))
 	if cfg.Verbose {
 		log.Printf(
-			"settings.resolved host=%s port=%d model=%s timeout=%s max_stored_items=%d max_concurrent_requests=%d auth_json=%s backend_base_url=%s api_key_configured=%t",
+			"settings.resolved host=%s port=%d model=%s timeout=%s max_stored_items=%d max_concurrent_requests=%d auth_json=%s backend_base_url=%s api_key_configured=%t auto_prompt_cache_key=%t",
 			cfg.Host, cfg.Port, cfg.Model, cfg.Timeout, cfg.MaxStored, cfg.Concurrency,
-			cfg.AuthJSON, cfg.BackendURL, cfg.APIKey != "",
+			cfg.AuthJSON, cfg.BackendURL, cfg.APIKey != "", cfg.AutoPromptCacheKey,
 		)
 	}
 	serveResult := make(chan error, 1)
