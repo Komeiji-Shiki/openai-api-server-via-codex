@@ -15,7 +15,7 @@
 
 ## 运行本仓库的定制版
 
-安装 Go 1.23 或更新版本，并准备好 Codex 登录后，从本仓库源码启动：
+安装 Go 1.26.10 或更新版本（1.27 分支至少使用 1.27.3），并准备好 Codex 登录后，从本仓库源码启动：
 
 ```console
 git clone https://github.com/Komeiji-Shiki/openai-api-server-via-codex.git
@@ -183,8 +183,8 @@ This server is useful when you want to:
 | [`uvx openai-api-server-via-codex`](#install-uvx) | `uv` and a Codex login | Most users |
 | [GitHub Release archive](#install-standalone-binary) | A Codex login | A standalone executable without Python or `uv` |
 | [GHCR image](#install-docker) | Docker and a Codex login | Containers and reproducible deployment |
-| [`go install ...@latest`](#install-go) | Go 1.23+ and a Codex login | Go users |
-| [Build from a checkout](docs/build-from-source.md#build-for-the-current-machine) | Go 1.23+ and a Codex login | Development and customization |
+| [`go install ...@latest`](#install-go) | Go 1.26.10+ (1.27.3+ on Go 1.27) and a Codex login | Go users |
+| [Build from a checkout](docs/build-from-source.md#build-for-the-current-machine) | Go 1.26.10+ (1.27.3+ on Go 1.27) and a Codex login | Development and customization |
 
 <a id="install-uvx"></a>
 <details>
@@ -729,7 +729,7 @@ contract, and release tooling.
 
 Requirements:
 
-- Go 1.23 or newer
+- Go 1.26.10 or newer; Go 1.27 users need 1.27.3 or newer
 - Python 3.10 or newer
 - `uv`
 

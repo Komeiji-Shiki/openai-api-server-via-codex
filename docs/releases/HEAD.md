@@ -1,5 +1,7 @@
 # HEAD
 
+- 构建要求提高至 Go 1.26.10，并指定 Go 1.27.3 工具链，包含泄露的 eMudhra 中间证书拒绝检查；开发环境锁定的 certifi 更新至 2026.10.19。
+
 - Merge upstream 0.2.1 and the following model-example update while retaining
   local caching, native response history, idle timeouts, and configuration paths.
 - Apply automatic prompt cache keys to WebSocket response creation and keep

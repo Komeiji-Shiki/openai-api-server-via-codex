@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build the production server as a static Go executable.
-FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS server-builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm AS server-builder
 
 WORKDIR /src
 

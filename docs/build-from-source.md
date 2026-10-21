@@ -6,7 +6,7 @@ or runtime.
 
 ## Requirements
 
-- Go 1.23 or newer
+- Go 1.26.10 or newer; Go 1.27 users need 1.27.3 or newer
 - Git, when cloning the repository or deriving a version string
 - A Codex ChatGPT login for running the completed server
 
